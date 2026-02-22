@@ -20,88 +20,6 @@ import { useAppThemeColors, useColorScheme } from '/@/renderer/themes/use-app-th
 import { Text } from '/@/shared/components/text/text';
 import { PlayerStatus } from '/@/shared/types/types';
 
-interface WaveformWorkerResult {
-    duration: number;
-    error?: string;
-    peaks: Float32Array[];
-}
-
-/**
- * Fetches audio, decodes it on the main thread, then
- * hands the raw PCM channel data to a Web Worker for CPU-intensive peak extraction
- */
-function useWaveformPeaks(url: string | undefined, samples = 1024) {
-    const [result, setResult] = useState<null | { duration: number; peaks: Float32Array[] }>(null);
-    const abortRef = useRef<AbortController | null>(null);
-    const workerRef = useRef<null | Worker>(null);
-
-    useEffect(() => {
-        setResult(null);
-        if (!url) return;
-
-        const abortController = new AbortController();
-        abortRef.current = abortController;
-
-        const worker = new Worker(new URL('../workers/waveform-worker.ts', import.meta.url), {
-            type: 'module',
-        });
-        workerRef.current = worker;
-
-        worker.onmessage = (e: MessageEvent<WaveformWorkerResult>) => {
-            if (e.data.error) {
-                console.error('Waveform worker error:', e.data.error);
-                return;
-            }
-            setResult({ duration: e.data.duration, peaks: e.data.peaks });
-        };
-
-        worker.onerror = (err) => {
-            console.error('Waveform worker failed:', err);
-        };
-
-        (async () => {
-            try {
-                const response = await fetch(url, { signal: abortController.signal });
-                const arrayBuffer = await response.arrayBuffer();
-                if (abortController.signal.aborted) return;
-
-                const audioCtx = new AudioContext();
-                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-                await audioCtx.close();
-                if (abortController.signal.aborted) return;
-
-                // Extract raw channel data and transfer to the worker for peak computation
-                const channelData: Float32Array[] = [];
-                const transferables: ArrayBuffer[] = [];
-
-                for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-                    const data = new Float32Array(audioBuffer.getChannelData(ch));
-                    channelData.push(data);
-                    transferables.push(data.buffer);
-                }
-
-                worker.postMessage(
-                    { channelData, duration: audioBuffer.duration, samples },
-                    transferables,
-                );
-            } catch (err: unknown) {
-                if (abortController.signal.aborted) return;
-                const message = err instanceof Error ? err.message : String(err);
-                console.error('Waveform extraction error:', message);
-            }
-        })();
-
-        return () => {
-            abortController.abort();
-            abortRef.current = null;
-            worker.terminate();
-            workerRef.current = null;
-        };
-    }, [url, samples]);
-
-    return result;
-}
-
 export const PlayerbarWaveform = () => {
     const currentSong = usePlayerSong();
     const playerbarSlider = usePlayerbarSlider();
@@ -117,6 +35,7 @@ export const PlayerbarWaveform = () => {
     const seekTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const lastSeekValueRef = useRef<null | number>(null);
     const containerPositionRef = useRef<DOMRect | null>(null);
+    const dummyAudioRef = useRef<HTMLAudioElement>(document.createElement('audio'));
 
     const songDuration = currentSong?.duration ? currentSong.duration / 1000 : 0;
 
@@ -125,9 +44,6 @@ export const PlayerbarWaveform = () => {
         enabled: true,
         format: 'mp3',
     });
-
-    // Pre-compute waveform peaks to prevent audio element creation by wavesurfer
-    const waveformResult = useWaveformPeaks(shouldRenderWaveform ? streamUrl : undefined);
 
     const { color } = useAppThemeColors();
     const primaryColor = (color['--theme-colors-primary'] as string) || 'rgb(53, 116, 252)';
@@ -174,22 +90,25 @@ export const PlayerbarWaveform = () => {
         fillParent: true,
         height: 18,
         interact: false,
+        media: dummyAudioRef.current,
         normalize: false,
         progressColor: primaryColor,
         waveColor,
     });
 
     useEffect(() => {
-        if (!wavesurfer || !waveformResult) return;
+        if (!wavesurfer || !shouldRenderWaveform || !streamUrl) return;
 
-        const handleReady = () => setIsLoading(false);
+        const handleReady = () => {
+            setIsLoading(false);
+        };
         wavesurfer.on('ready', handleReady);
-        wavesurfer.load('', waveformResult.peaks, waveformResult.duration); // Load pre-computed peaks
+        wavesurfer.load(streamUrl);
 
         return () => {
             wavesurfer.un('ready', handleReady);
         };
-    }, [wavesurfer, waveformResult]);
+    }, [wavesurfer, shouldRenderWaveform, streamUrl]);
 
     // Handle drag start on waveform
     useEffect(() => {
