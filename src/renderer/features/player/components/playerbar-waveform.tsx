@@ -20,14 +20,21 @@ import { useAppThemeColors, useColorScheme } from '/@/renderer/themes/use-app-th
 import { Text } from '/@/shared/components/text/text';
 import { PlayerStatus } from '/@/shared/types/types';
 
+interface WaveformWorkerResult {
+    duration: number;
+    error?: string;
+    peaks: Float32Array[];
+}
+
 /**
- * Fetches audio, decodes it via OfflineAudioContext + AnalyserNode with suspend(),
- * and extracts waveform peaks. OfflineAudioContext rendering already runs off the
- * main thread internally, so no Web Worker is needed.
+ * Fetches audio, decodes it on the main thread (required in Electron), then
+ * hands the raw PCM channel data to a Web Worker for CPU-intensive peak
+ * extraction — keeping the main thread responsive.
  */
 function useWaveformPeaks(url: string | undefined, samples = 1024) {
     const [result, setResult] = useState<null | { duration: number; peaks: Float32Array[] }>(null);
     const abortRef = useRef<AbortController | null>(null);
+    const workerRef = useRef<null | Worker>(null);
 
     useEffect(() => {
         setResult(null);
@@ -36,103 +43,50 @@ function useWaveformPeaks(url: string | undefined, samples = 1024) {
         const abortController = new AbortController();
         abortRef.current = abortController;
 
+        const worker = new Worker(new URL('../workers/waveform-worker.ts', import.meta.url), {
+            type: 'module',
+        });
+        workerRef.current = worker;
+
+        worker.onmessage = (e: MessageEvent<WaveformWorkerResult>) => {
+            if (e.data.error) {
+                console.error('Waveform worker error:', e.data.error);
+                return;
+            }
+            setResult({ duration: e.data.duration, peaks: e.data.peaks });
+        };
+
+        worker.onerror = (err) => {
+            console.error('Waveform worker failed:', err);
+        };
+
         (async () => {
             try {
                 const response = await fetch(url, { signal: abortController.signal });
                 const arrayBuffer = await response.arrayBuffer();
                 if (abortController.signal.aborted) return;
 
-                // Decode the audio data using a temporary AudioContext
-                const tempCtx = new AudioContext();
-                const audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
-                await tempCtx.close();
+                // Decode audio on main thread (AudioContext is not available in Workers in Electron)
+                const audioCtx = new AudioContext();
+                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+                await audioCtx.close();
                 if (abortController.signal.aborted) return;
 
-                const { length, numberOfChannels, sampleRate } = audioBuffer;
-                const durationInSeconds = length / sampleRate;
-                const renderQuantumSize = 128;
-                const renderQuantumInSeconds = renderQuantumSize / sampleRate;
+                // Extract raw channel data and transfer to the worker for peak computation
+                const channelData: Float32Array[] = [];
+                const transferables: ArrayBuffer[] = [];
 
-                // Determine how many render quanta we need per sample bucket
-                const totalQuanta = Math.floor(length / renderQuantumSize);
-                const quantaPerSample = Math.max(1, Math.floor(totalQuanta / samples));
-                const actualSamples = Math.min(samples, totalQuanta);
-
-                // Set up OfflineAudioContext for rendering
-                const offlineCtx = new OfflineAudioContext({
-                    length,
-                    numberOfChannels,
-                    sampleRate,
-                });
-                const sourceNode = new AudioBufferSourceNode(offlineCtx, { buffer: audioBuffer });
-                const analyserNode = new AnalyserNode(offlineCtx, { fftSize: 2048 });
-                sourceNode.connect(analyserNode);
-                analyserNode.connect(offlineCtx.destination);
-                sourceNode.start();
-
-                // Collect peak amplitude data using suspend() at precise render quanta
-                const peaks: Float32Array[] = Array.from(
-                    { length: numberOfChannels },
-                    () => new Float32Array(actualSamples),
-                );
-                const timeDomainData = new Float32Array(analyserNode.fftSize);
-
-                let sampleIndex = 0;
-
-                // Use the OfflineAudioContext suspend/resume pattern to sample
-                // the AnalyserNode at deterministic points in time.
-                const renderingDone = new Promise<void>((resolve, reject) => {
-                    const analyze = (quantumIndex: number) => {
-                        if (abortController.signal.aborted) {
-                            reject(new DOMException('Aborted', 'AbortError'));
-                            return;
-                        }
-
-                        const suspendTime = renderQuantumInSeconds * quantumIndex;
-
-                        if (suspendTime < durationInSeconds && sampleIndex < actualSamples) {
-                            offlineCtx.suspend(suspendTime).then(() => {
-                                if (abortController.signal.aborted) {
-                                    return;
-                                }
-
-                                analyserNode.getFloatTimeDomainData(timeDomainData);
-
-                                // Extract peak from the time-domain data
-                                let max = 0;
-                                for (let i = 0; i < timeDomainData.length; i++) {
-                                    const abs = Math.abs(timeDomainData[i]);
-                                    if (abs > max) max = abs;
-                                }
-
-                                // Store the peak for all channels (analyser merges channels)
-                                for (let ch = 0; ch < numberOfChannels; ch++) {
-                                    peaks[ch][sampleIndex] = max;
-                                }
-                                sampleIndex++;
-
-                                analyze(quantumIndex + quantaPerSample);
-                            });
-                        }
-
-                        if (quantumIndex === 1) {
-                            offlineCtx
-                                .startRendering()
-                                .then(() => resolve())
-                                .catch(reject);
-                        } else {
-                            offlineCtx.resume();
-                        }
-                    };
-
-                    analyze(1);
-                });
-
-                await renderingDone;
-
-                if (!abortController.signal.aborted) {
-                    setResult({ duration: durationInSeconds, peaks });
+                for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+                    // getChannelData returns a reference; copy it so we can transfer
+                    const data = new Float32Array(audioBuffer.getChannelData(ch));
+                    channelData.push(data);
+                    transferables.push(data.buffer);
                 }
+
+                worker.postMessage(
+                    { channelData, duration: audioBuffer.duration, samples },
+                    transferables,
+                );
             } catch (err: unknown) {
                 if (abortController.signal.aborted) return;
                 const message = err instanceof Error ? err.message : String(err);
@@ -143,6 +97,8 @@ function useWaveformPeaks(url: string | undefined, samples = 1024) {
         return () => {
             abortController.abort();
             abortRef.current = null;
+            worker.terminate();
+            workerRef.current = null;
         };
     }, [url, samples]);
 
@@ -175,7 +131,7 @@ export const PlayerbarWaveform = () => {
 
     // Only start fetching/decoding after playback has started (shouldRenderWaveform = true)
     // to avoid competing with the player's audio stream fetch.
-    // Peaks are extracted entirely in a Web Worker — zero main-thread decode work.
+    // Audio is decoded on main thread, then peak extraction runs in a Web Worker.
     const waveformResult = useWaveformPeaks(shouldRenderWaveform ? streamUrl : undefined);
 
     const { color } = useAppThemeColors();
