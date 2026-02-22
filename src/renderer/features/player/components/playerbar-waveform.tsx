@@ -20,6 +20,135 @@ import { useAppThemeColors, useColorScheme } from '/@/renderer/themes/use-app-th
 import { Text } from '/@/shared/components/text/text';
 import { PlayerStatus } from '/@/shared/types/types';
 
+/**
+ * Fetches audio, decodes it via OfflineAudioContext + AnalyserNode with suspend(),
+ * and extracts waveform peaks. OfflineAudioContext rendering already runs off the
+ * main thread internally, so no Web Worker is needed.
+ */
+function useWaveformPeaks(url: string | undefined, samples = 1024) {
+    const [result, setResult] = useState<null | { duration: number; peaks: Float32Array[] }>(null);
+    const abortRef = useRef<AbortController | null>(null);
+
+    useEffect(() => {
+        setResult(null);
+        if (!url) return;
+
+        const abortController = new AbortController();
+        abortRef.current = abortController;
+
+        (async () => {
+            try {
+                const response = await fetch(url, { signal: abortController.signal });
+                const arrayBuffer = await response.arrayBuffer();
+                if (abortController.signal.aborted) return;
+
+                // Decode the audio data using a temporary AudioContext
+                const tempCtx = new AudioContext();
+                const audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+                await tempCtx.close();
+                if (abortController.signal.aborted) return;
+
+                const { length, numberOfChannels, sampleRate } = audioBuffer;
+                const durationInSeconds = length / sampleRate;
+                const renderQuantumSize = 128;
+                const renderQuantumInSeconds = renderQuantumSize / sampleRate;
+
+                // Determine how many render quanta we need per sample bucket
+                const totalQuanta = Math.floor(length / renderQuantumSize);
+                const quantaPerSample = Math.max(1, Math.floor(totalQuanta / samples));
+                const actualSamples = Math.min(samples, totalQuanta);
+
+                // Set up OfflineAudioContext for rendering
+                const offlineCtx = new OfflineAudioContext({
+                    length,
+                    numberOfChannels,
+                    sampleRate,
+                });
+                const sourceNode = new AudioBufferSourceNode(offlineCtx, { buffer: audioBuffer });
+                const analyserNode = new AnalyserNode(offlineCtx, { fftSize: 2048 });
+                sourceNode.connect(analyserNode);
+                analyserNode.connect(offlineCtx.destination);
+                sourceNode.start();
+
+                // Collect peak amplitude data using suspend() at precise render quanta
+                const peaks: Float32Array[] = Array.from(
+                    { length: numberOfChannels },
+                    () => new Float32Array(actualSamples),
+                );
+                const timeDomainData = new Float32Array(analyserNode.fftSize);
+
+                let sampleIndex = 0;
+
+                // Use the OfflineAudioContext suspend/resume pattern to sample
+                // the AnalyserNode at deterministic points in time.
+                const renderingDone = new Promise<void>((resolve, reject) => {
+                    const analyze = (quantumIndex: number) => {
+                        if (abortController.signal.aborted) {
+                            reject(new DOMException('Aborted', 'AbortError'));
+                            return;
+                        }
+
+                        const suspendTime = renderQuantumInSeconds * quantumIndex;
+
+                        if (suspendTime < durationInSeconds && sampleIndex < actualSamples) {
+                            offlineCtx.suspend(suspendTime).then(() => {
+                                if (abortController.signal.aborted) {
+                                    return;
+                                }
+
+                                analyserNode.getFloatTimeDomainData(timeDomainData);
+
+                                // Extract peak from the time-domain data
+                                let max = 0;
+                                for (let i = 0; i < timeDomainData.length; i++) {
+                                    const abs = Math.abs(timeDomainData[i]);
+                                    if (abs > max) max = abs;
+                                }
+
+                                // Store the peak for all channels (analyser merges channels)
+                                for (let ch = 0; ch < numberOfChannels; ch++) {
+                                    peaks[ch][sampleIndex] = max;
+                                }
+                                sampleIndex++;
+
+                                analyze(quantumIndex + quantaPerSample);
+                            });
+                        }
+
+                        if (quantumIndex === 1) {
+                            offlineCtx
+                                .startRendering()
+                                .then(() => resolve())
+                                .catch(reject);
+                        } else {
+                            offlineCtx.resume();
+                        }
+                    };
+
+                    analyze(1);
+                });
+
+                await renderingDone;
+
+                if (!abortController.signal.aborted) {
+                    setResult({ duration: durationInSeconds, peaks });
+                }
+            } catch (err: unknown) {
+                if (abortController.signal.aborted) return;
+                const message = err instanceof Error ? err.message : String(err);
+                console.error('Waveform extraction error:', message);
+            }
+        })();
+
+        return () => {
+            abortController.abort();
+            abortRef.current = null;
+        };
+    }, [url, samples]);
+
+    return result;
+}
+
 export const PlayerbarWaveform = () => {
     const currentSong = usePlayerSong();
     const playerbarSlider = usePlayerbarSlider();
@@ -40,9 +169,14 @@ export const PlayerbarWaveform = () => {
 
     const streamUrl = useSongUrl(currentSong, true, {
         bitrate: 64,
-        enabled: shouldRenderWaveform,
+        enabled: true,
         format: 'mp3',
     });
+
+    // Only start fetching/decoding after playback has started (shouldRenderWaveform = true)
+    // to avoid competing with the player's audio stream fetch.
+    // Peaks are extracted entirely in a Web Worker — zero main-thread decode work.
+    const waveformResult = useWaveformPeaks(shouldRenderWaveform ? streamUrl : undefined);
 
     const { color } = useAppThemeColors();
     const primaryColor = (color['--theme-colors-primary'] as string) || 'rgb(53, 116, 252)';
@@ -91,84 +225,26 @@ export const PlayerbarWaveform = () => {
         interact: false,
         normalize: false,
         progressColor: primaryColor,
-        url: streamUrl || undefined,
         waveColor,
     });
 
-    // Reset loading state when stream URL changes and ensure media is muted
+    // Load pre-computed peaks into wavesurfer — only lightweight canvas rendering happens on main thread.
+    // No audio element is created (empty URL), no decode work, no resource competition.
     useEffect(() => {
-        if (!wavesurfer || !shouldRenderWaveform) return;
+        if (!wavesurfer || !waveformResult) return;
 
-        setIsLoading(true);
-        wavesurfer.setVolume(0);
-        const mediaElement = wavesurfer.getMediaElement();
-        if (mediaElement) {
-            mediaElement.muted = true;
-            mediaElement.volume = 0;
-        }
-    }, [streamUrl, wavesurfer, shouldRenderWaveform]);
-
-    // Handle waveform ready state
-    useEffect(() => {
-        if (!wavesurfer || !shouldRenderWaveform) return;
-
-        const handleReady = () => {
-            setIsLoading(false);
-            const mediaElement = wavesurfer.getMediaElement();
-            if (mediaElement) {
-                mediaElement.muted = true;
-                mediaElement.volume = 0;
-            }
-        };
-
+        const handleReady = () => setIsLoading(false);
         wavesurfer.on('ready', handleReady);
-
-        // Check if already loaded
-        if (wavesurfer.getDuration() > 0) {
-            setIsLoading(false);
-            const mediaElement = wavesurfer.getMediaElement();
-            if (mediaElement) {
-                mediaElement.muted = true;
-                mediaElement.volume = 0;
-            }
-        }
+        wavesurfer.load('', waveformResult.peaks, waveformResult.duration);
 
         return () => {
             wavesurfer.un('ready', handleReady);
         };
-    }, [wavesurfer, shouldRenderWaveform]);
-
-    useEffect(() => {
-        if (!wavesurfer || !shouldRenderWaveform) return;
-
-        // Ensure waveform never plays - it's just for visualization
-        wavesurfer.setVolume(0);
-
-        const muteMediaElement = () => {
-            const mediaElement = wavesurfer.getMediaElement();
-            if (mediaElement) {
-                mediaElement.muted = true;
-                mediaElement.volume = 0;
-            }
-        };
-
-        muteMediaElement();
-
-        const preventPlay = () => {
-            wavesurfer.pause();
-            muteMediaElement(); // Ensure it stays muted
-        };
-
-        wavesurfer.on('play', preventPlay);
-
-        return () => {
-            wavesurfer.un('play', preventPlay);
-        };
-    }, [wavesurfer, shouldRenderWaveform]);
+    }, [wavesurfer, waveformResult]);
 
     // Handle drag start on waveform
     useEffect(() => {
-        if (!shouldRenderWaveform || !wavesurfer || !songDuration || !containerRef.current) return;
+        if (isLoading || !wavesurfer || !songDuration || !containerRef.current) return;
 
         const container = containerRef.current;
         let isDraggingLocal = false;
@@ -325,7 +401,7 @@ export const PlayerbarWaveform = () => {
                 clearTimeout(seekTimeoutRef.current);
             }
         };
-    }, [wavesurfer, songDuration, mediaSeekToTimestamp, shouldRenderWaveform]);
+    }, [wavesurfer, songDuration, mediaSeekToTimestamp, isLoading]);
 
     // Sync dragging state when currentTime catches up to seek value
     useEffect(() => {
@@ -345,14 +421,14 @@ export const PlayerbarWaveform = () => {
 
     // Update waveform progress based on player current time (only when not dragging)
     useEffect(() => {
-        if (!shouldRenderWaveform || !wavesurfer || !songDuration || isDragging) return;
+        if (isLoading || !wavesurfer || !songDuration || isDragging) return;
 
         const duration = wavesurfer.getDuration();
         if (duration > 0 && currentTime >= 0) {
             const ratio = currentTime / duration;
             wavesurfer.seekTo(ratio);
         }
-    }, [wavesurfer, currentTime, songDuration, isDragging, shouldRenderWaveform]);
+    }, [wavesurfer, currentTime, songDuration, isDragging, isLoading]);
 
     // Show disabled slider when there's no current song
     if (!currentSong) {
@@ -373,21 +449,24 @@ export const PlayerbarWaveform = () => {
 
     return (
         <div
-            className={shouldRenderWaveform ? styles.wavesurferContainer : undefined}
+            className={styles.wavesurferContainer}
             onClick={(e) => {
                 e?.stopPropagation();
             }}
             style={{ position: 'relative' }}
         >
             <motion.div
-                animate={{ opacity: shouldRenderWaveform && !isLoading ? 1 : 0 }}
+                animate={{ opacity: !isLoading ? 1 : 0 }}
                 className={styles.waveform}
                 initial={{ opacity: 0 }}
                 ref={containerRef}
-                style={{ pointerEvents: shouldRenderWaveform && !isLoading ? 'auto' : 'none' }}
+                style={{
+                    minHeight: 18,
+                    pointerEvents: !isLoading ? 'auto' : 'none',
+                }}
                 transition={{ duration: 0.2 }}
             />
-            {(!shouldRenderWaveform || isLoading) && (
+            {isLoading && (
                 <motion.div
                     animate={{ opacity: 1 }}
                     initial={{ opacity: 0 }}
@@ -403,7 +482,7 @@ export const PlayerbarWaveform = () => {
                     <PlayerbarSeekSlider max={songDuration} min={0} />
                 </motion.div>
             )}
-            {tooltipPosition && isDragging && shouldRenderWaveform && (
+            {tooltipPosition && isDragging && !isLoading && (
                 <motion.div
                     animate={{ opacity: 1, scale: 1, x: '-50%' }}
                     className={styles.tooltip}
