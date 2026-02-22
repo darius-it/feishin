@@ -2,9 +2,6 @@
  * Web Worker that extracts waveform peaks from raw PCM channel data.
  * Receives pre-decoded Float32Array channel data from the main thread
  * and performs the CPU-intensive peak extraction off the main thread.
- *
- * Input message:  { channelData: Float32Array[], duration: number, samples?: number }
- * Output message: { peaks: Float32Array[], duration: number } or { error: string }
  */
 
 self.onmessage = (

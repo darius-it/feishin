@@ -27,9 +27,8 @@ interface WaveformWorkerResult {
 }
 
 /**
- * Fetches audio, decodes it on the main thread (required in Electron), then
- * hands the raw PCM channel data to a Web Worker for CPU-intensive peak
- * extraction — keeping the main thread responsive.
+ * Fetches audio, decodes it on the main thread, then
+ * hands the raw PCM channel data to a Web Worker for CPU-intensive peak extraction
  */
 function useWaveformPeaks(url: string | undefined, samples = 1024) {
     const [result, setResult] = useState<null | { duration: number; peaks: Float32Array[] }>(null);
@@ -66,7 +65,6 @@ function useWaveformPeaks(url: string | undefined, samples = 1024) {
                 const arrayBuffer = await response.arrayBuffer();
                 if (abortController.signal.aborted) return;
 
-                // Decode audio on main thread (AudioContext is not available in Workers in Electron)
                 const audioCtx = new AudioContext();
                 const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
                 await audioCtx.close();
@@ -77,7 +75,6 @@ function useWaveformPeaks(url: string | undefined, samples = 1024) {
                 const transferables: ArrayBuffer[] = [];
 
                 for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-                    // getChannelData returns a reference; copy it so we can transfer
                     const data = new Float32Array(audioBuffer.getChannelData(ch));
                     channelData.push(data);
                     transferables.push(data.buffer);
@@ -129,9 +126,7 @@ export const PlayerbarWaveform = () => {
         format: 'mp3',
     });
 
-    // Only start fetching/decoding after playback has started (shouldRenderWaveform = true)
-    // to avoid competing with the player's audio stream fetch.
-    // Audio is decoded on main thread, then peak extraction runs in a Web Worker.
+    // Pre-compute waveform peaks to prevent audio element creation by wavesurfer
     const waveformResult = useWaveformPeaks(shouldRenderWaveform ? streamUrl : undefined);
 
     const { color } = useAppThemeColors();
@@ -184,14 +179,12 @@ export const PlayerbarWaveform = () => {
         waveColor,
     });
 
-    // Load pre-computed peaks into wavesurfer — only lightweight canvas rendering happens on main thread.
-    // No audio element is created (empty URL), no decode work, no resource competition.
     useEffect(() => {
         if (!wavesurfer || !waveformResult) return;
 
         const handleReady = () => setIsLoading(false);
         wavesurfer.on('ready', handleReady);
-        wavesurfer.load('', waveformResult.peaks, waveformResult.duration);
+        wavesurfer.load('', waveformResult.peaks, waveformResult.duration); // Load pre-computed peaks
 
         return () => {
             wavesurfer.un('ready', handleReady);
