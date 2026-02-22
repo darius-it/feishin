@@ -1,25 +1,34 @@
 import { useWavesurfer } from '@wavesurfer/react';
 import formatDuration from 'format-duration';
-import { AnimatePresence, motion } from 'motion/react';
+import { motion } from 'motion/react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+import { PlayerbarSeekSlider } from './playerbar-seek-slider';
 import { CustomPlayerbarSlider } from './playerbar-slider';
 import styles from './playerbar-waveform.module.css';
 
 import { useSongUrl } from '/@/renderer/features/player/audio-player/hooks/use-stream-url';
 import { usePlayer } from '/@/renderer/features/player/context/player-context';
-import { BarAlign, usePlayerbarSlider, usePlayerSong, usePlayerTimestamp } from '/@/renderer/store';
+import {
+    BarAlign,
+    usePlayerbarSlider,
+    usePlayerSong,
+    usePlayerStatus,
+    usePlayerTimestamp,
+} from '/@/renderer/store';
 import { useAppThemeColors, useColorScheme } from '/@/renderer/themes/use-app-theme';
-import { Spinner } from '/@/shared/components/spinner/spinner';
 import { Text } from '/@/shared/components/text/text';
+import { PlayerStatus } from '/@/shared/types/types';
 
 export const PlayerbarWaveform = () => {
     const currentSong = usePlayerSong();
     const playerbarSlider = usePlayerbarSlider();
     const currentTime = usePlayerTimestamp();
+    const status = usePlayerStatus();
     const containerRef = useRef<HTMLDivElement>(null);
     const { mediaSeekToTimestamp } = usePlayer();
     const [isLoading, setIsLoading] = useState(true);
+    const [shouldRenderWaveform, setShouldRenderWaveform] = useState(false);
     const [isDragging, setIsDragging] = useState(false);
     const [tooltipPosition, setTooltipPosition] = useState<null | { x: number; y: number }>(null);
     const [tooltipValue, setTooltipValue] = useState(0);
@@ -29,7 +38,11 @@ export const PlayerbarWaveform = () => {
 
     const songDuration = currentSong?.duration ? currentSong.duration / 1000 : 0;
 
-    const streamUrl = useSongUrl(currentSong, true, { bitrate: 64, enabled: true, format: 'mp3' });
+    const streamUrl = useSongUrl(currentSong, true, {
+        bitrate: 64,
+        enabled: shouldRenderWaveform,
+        format: 'mp3',
+    });
 
     const { color } = useAppThemeColors();
     const primaryColor = (color['--theme-colors-primary'] as string) || 'rgb(53, 116, 252)';
@@ -43,6 +56,26 @@ export const PlayerbarWaveform = () => {
     const cursorColor = useMemo(() => {
         return colorScheme === 'dark' ? 'rgba(255, 255, 255, 0.5)' : 'rgba(0, 0, 0, 0.5)';
     }, [colorScheme]);
+
+    useEffect(() => {
+        setShouldRenderWaveform(false);
+        setIsLoading(true);
+    }, [currentSong?.id]);
+
+    useEffect(() => {
+        if (!currentSong || shouldRenderWaveform) return;
+
+        if (currentTime > 0) {
+            setShouldRenderWaveform(true);
+            return;
+        }
+
+        if (status !== PlayerStatus.PLAYING) {
+            return;
+        }
+
+        setShouldRenderWaveform(true);
+    }, [currentSong, currentTime, shouldRenderWaveform, status]);
 
     const { wavesurfer } = useWavesurfer({
         barAlign:
@@ -64,20 +97,20 @@ export const PlayerbarWaveform = () => {
 
     // Reset loading state when stream URL changes and ensure media is muted
     useEffect(() => {
+        if (!wavesurfer || !shouldRenderWaveform) return;
+
         setIsLoading(true);
-        if (wavesurfer) {
-            wavesurfer.setVolume(0);
-            const mediaElement = wavesurfer.getMediaElement();
-            if (mediaElement) {
-                mediaElement.muted = true;
-                mediaElement.volume = 0;
-            }
+        wavesurfer.setVolume(0);
+        const mediaElement = wavesurfer.getMediaElement();
+        if (mediaElement) {
+            mediaElement.muted = true;
+            mediaElement.volume = 0;
         }
-    }, [streamUrl, wavesurfer]);
+    }, [streamUrl, wavesurfer, shouldRenderWaveform]);
 
     // Handle waveform ready state
     useEffect(() => {
-        if (!wavesurfer) return;
+        if (!wavesurfer || !shouldRenderWaveform) return;
 
         const handleReady = () => {
             setIsLoading(false);
@@ -103,10 +136,10 @@ export const PlayerbarWaveform = () => {
         return () => {
             wavesurfer.un('ready', handleReady);
         };
-    }, [wavesurfer]);
+    }, [wavesurfer, shouldRenderWaveform]);
 
     useEffect(() => {
-        if (!wavesurfer) return;
+        if (!wavesurfer || !shouldRenderWaveform) return;
 
         // Ensure waveform never plays - it's just for visualization
         wavesurfer.setVolume(0);
@@ -131,11 +164,11 @@ export const PlayerbarWaveform = () => {
         return () => {
             wavesurfer.un('play', preventPlay);
         };
-    }, [wavesurfer]);
+    }, [wavesurfer, shouldRenderWaveform]);
 
     // Handle drag start on waveform
     useEffect(() => {
-        if (!wavesurfer || !songDuration || !containerRef.current) return;
+        if (!shouldRenderWaveform || !wavesurfer || !songDuration || !containerRef.current) return;
 
         const container = containerRef.current;
         let isDraggingLocal = false;
@@ -292,7 +325,7 @@ export const PlayerbarWaveform = () => {
                 clearTimeout(seekTimeoutRef.current);
             }
         };
-    }, [wavesurfer, songDuration, mediaSeekToTimestamp]);
+    }, [wavesurfer, songDuration, mediaSeekToTimestamp, shouldRenderWaveform]);
 
     // Sync dragging state when currentTime catches up to seek value
     useEffect(() => {
@@ -312,14 +345,14 @@ export const PlayerbarWaveform = () => {
 
     // Update waveform progress based on player current time (only when not dragging)
     useEffect(() => {
-        if (!wavesurfer || !songDuration || isDragging) return;
+        if (!shouldRenderWaveform || !wavesurfer || !songDuration || isDragging) return;
 
         const duration = wavesurfer.getDuration();
         if (duration > 0 && currentTime >= 0) {
             const ratio = currentTime / duration;
             wavesurfer.seekTo(ratio);
         }
-    }, [wavesurfer, currentTime, songDuration, isDragging]);
+    }, [wavesurfer, currentTime, songDuration, isDragging, shouldRenderWaveform]);
 
     // Show disabled slider when there's no current song
     if (!currentSong) {
@@ -340,39 +373,37 @@ export const PlayerbarWaveform = () => {
 
     return (
         <div
-            className={styles.wavesurferContainer}
+            className={shouldRenderWaveform ? styles.wavesurferContainer : undefined}
             onClick={(e) => {
                 e?.stopPropagation();
             }}
             style={{ position: 'relative' }}
         >
             <motion.div
-                animate={{ opacity: isLoading ? 0 : 1 }}
+                animate={{ opacity: shouldRenderWaveform && !isLoading ? 1 : 0 }}
                 className={styles.waveform}
                 initial={{ opacity: 0 }}
                 ref={containerRef}
+                style={{ pointerEvents: shouldRenderWaveform && !isLoading ? 'auto' : 'none' }}
                 transition={{ duration: 0.2 }}
             />
-            <AnimatePresence>
-                {isLoading && (
-                    <motion.div
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        initial={{ opacity: 0 }}
-                        style={{
-                            height: '100%',
-                            left: 0,
-                            position: 'absolute',
-                            top: 0,
-                            width: '100%',
-                        }}
-                        transition={{ duration: 0.2 }}
-                    >
-                        <Spinner container />
-                    </motion.div>
-                )}
-            </AnimatePresence>
-            {tooltipPosition && isDragging && (
+            {(!shouldRenderWaveform || isLoading) && (
+                <motion.div
+                    animate={{ opacity: 1 }}
+                    initial={{ opacity: 0 }}
+                    style={{
+                        height: '100%',
+                        left: 0,
+                        position: 'absolute',
+                        top: 3,
+                        width: '100%',
+                    }}
+                    transition={{ duration: 0.2 }}
+                >
+                    <PlayerbarSeekSlider max={songDuration} min={0} />
+                </motion.div>
+            )}
+            {tooltipPosition && isDragging && shouldRenderWaveform && (
                 <motion.div
                     animate={{ opacity: 1, scale: 1, x: '-50%' }}
                     className={styles.tooltip}
