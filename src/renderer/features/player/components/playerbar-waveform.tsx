@@ -305,14 +305,10 @@ export const PlayerbarWaveform = () => {
             style={{ position: 'relative' }}
         >
             <motion.div
-                animate={{ opacity: !isLoading ? 1 : 0 }}
+                animate={{ opacity: isLoading ? 0 : 1 }}
                 className={styles.waveform}
                 initial={{ opacity: 0 }}
                 ref={containerRef}
-                style={{
-                    minHeight: 18,
-                    pointerEvents: !isLoading ? 'auto' : 'none',
-                }}
                 transition={{ duration: 0.2 }}
             />
             <AnimatePresence>
